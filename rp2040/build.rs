@@ -13,6 +13,10 @@ use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
 
+use dotenvy::dotenv;
+
+const KEY_LIST: [&str; 3] = ["DEVEUI", "APPEUI", "APPKEY"];
+
 fn main() {
     // Put `memory.x` in our output directory and ensure it's
     // on the linker search path.
@@ -33,4 +37,12 @@ fn main() {
     println!("cargo:rustc-link-arg-bins=-Tlink.x");
     println!("cargo:rustc-link-arg-bins=-Tlink-rp.x");
     println!("cargo:rustc-link-arg-bins=-Tdefmt.x");
+
+    dotenv().expect(".env file not found!");
+
+    for (key, value) in env::vars() {
+        if KEY_LIST.iter().any(|v| *v == key) {
+            println!("cargo:rustc-env={key}={value}");
+        }
+    }
 }

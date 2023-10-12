@@ -1,0 +1,29 @@
+[package]
+name = "mipidsi"
+description = "MIPI Display Serial Interface generic driver"
+version = "0.8.0-alpha.1"
+authors = ["Ales Katona <almindor@gmail.com>"]
+edition = "2018"
+license = "MIT"
+repository = "https://github.com/almindor/mipidsi"
+keywords = ["embedded-hal-driver", "mipi", "dsi", "display"]
+readme = "README.md"
+documentation = "https://docs.rs/mipidsi"
+rust-version = "1.61"
+
+[dependencies]
+display-interface = { git = "https://github.com/therealprof/display-interface", version = "0.5.0-alpha.1" }
+embedded-graphics-core = "0.4.0"
+embedded-hal = "1.0.0-alpha.11"
+embedded-hal-async = "1.0.0-alpha.11"
+nb = "1.0.0"
+
+[dependencies.heapless]
+optional = true
+version = "0.7.16"
+
+[features]
+default = ["batch", "async", "framebuffer"] # TODO: Remove async as default after feature completed
+batch = ["heapless"]
+async =  ["display-interface/async", "display-interface/nightly"]
+framebuffer = []
