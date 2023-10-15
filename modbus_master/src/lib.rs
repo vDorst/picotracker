@@ -7,15 +7,15 @@
 use core::num::NonZeroU8;
 use core::ops::RangeInclusive;
 
-/// Minimal Modbus Frame Length <ADDR> <FUNC+0x80> <ERRORCODE> <CRC_HIGH> <CRC_LOW>
+/// Minimal Modbus Frame Length `<ADDR> <FUNC+0x80> <ERRORCODE> <CRC_HIGH> <CRC_LOW>`
 const MODBUS_FRAME_LEN_MIN: u8 = 5;
-/// Maximum Modbus RTU FrameLength.
-const MODBUS_FRAME_LEN_MAX: u8 = 255;
+/// Maximum Modbus RTU `FrameLength`.
+pub const MODBUS_FRAME_LEN_MAX: u8 = 255;
 
 /// Valid Modbus address range
 const MODBUS_SLAVE_ADDR_RANGE: RangeInclusive<u8> = 1..=247;
 
-#[derive(Debug, Default, PartialEq, Eq, Clone)]
+#[derive(Debug, Default, PartialEq, Eq, Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum ModbusStateError {
     #[default]
@@ -28,7 +28,7 @@ pub enum ModbusStateError {
     Crc,
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq, Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum ModbusState {
     #[default]
@@ -46,22 +46,20 @@ pub struct Modbus<const N: usize> {
     //queue: Producer<'static, Box<SERMB>, 4>,
 }
 
+/// CRC-16-IBM/CRC-16-ANSI
 #[must_use]
-pub fn calc_crc(data: &[u8]) -> u16 {
-    let mut crc = 0xFFFFu16;
-
-    for &byte in data {
+pub fn crc16(data: &[u8]) -> u16 {
+    data.iter().fold(0xFFFF_u16, |mut crc, &byte| {
         crc ^= u16::from(byte);
-        for _ in 0..8 {
-            let check = crc & 0x0001;
+        for _ in 0..u8::BITS {
+            let is_lsb_set = (crc & 0x0001) != 0;
             crc >>= 1;
-            if check != 0 {
+            if is_lsb_set {
                 crc ^= 0xA001;
             }
         }
-    }
-
-    crc
+        crc
+    })
 }
 
 pub struct ModbusAddr(Option<NonZeroU8>);
@@ -132,6 +130,8 @@ impl<const N: usize> Modbus<N> {
                     || self.addr.0.is_some_and(|addr| u8::from(addr) == data)
                     || data == 0
                 {
+                    // Clear the buffer.
+                    self.idx = 0;
                     let _ = self.push(data);
                     ModbusState::InTrans(ModbusStateError::None)
                 } else {
@@ -144,23 +144,24 @@ impl<const N: usize> Modbus<N> {
                 }
             }
             ModbusState::WaitForT3_5(_) => {
-                self.state = ModbusState::InTrans(ModbusStateError::MoreDataAtferT35)
+                self.state = ModbusState::InTrans(ModbusStateError::MoreDataAtferT35);
             }
         }
     }
 
     /// Should be called bij de t1.5/t3.5 timer interrupt
     pub fn timer_handle(&mut self) -> Result<u8, ModbusStateError> {
-        let mut ret = Err(ModbusStateError::None);
+        match self.state {
+            ModbusState::WaitForT3_5(mbs_err) => {
+                // Go back to Idle
+                self.state = ModbusState::Idle;
 
-        match &self.state {
-            ModbusState::WaitForT3_5(err) => {
                 // self.tmr.disable_timer();
-                if matches!(err, ModbusStateError::None) {
+                if matches!(mbs_err, ModbusStateError::None) {
                     if self.idx >= MODBUS_FRAME_LEN_MIN {
                         let crc_start = self.idx() - 2;
                         let crc_data = &self.buf[0..crc_start];
-                        let crc_calc = calc_crc(crc_data).to_le_bytes();
+                        let crc_calc = crc16(crc_data).to_le_bytes();
                         let crc_calc = crc_calc.as_slice();
                         let crc_recv = &self.buf[crc_start..self.idx()];
                         if crc_calc == crc_recv {
@@ -171,7 +172,7 @@ impl<const N: usize> Modbus<N> {
                             // }
                             #[cfg(feature = "std")]
                             println!("Got valid data D: {:02x?}", crc_data);
-                            ret = Ok(u8::try_from(crc_start & 0xFF).unwrap());
+                            Ok(u8::try_from(crc_start & 0xFF).unwrap())
                         } else {
                             // #[cfg(feature = "defmt")]
                             // defmt::println!("CRC C: {:X} R {:X} D: {:X}", crc_calc, crc_recv, crc_data);
@@ -180,27 +181,21 @@ impl<const N: usize> Modbus<N> {
                                 "CRC C: {:02x?} R {:02x?} D: {:02x?}",
                                 crc_calc, crc_recv, crc_data
                             );
-                            ret = Err(ModbusStateError::Crc);
+                            Err(ModbusStateError::Crc)
                         }
                     } else {
-                        ret = Err(ModbusStateError::TooShort);
+                        Err(ModbusStateError::TooShort)
                     }
                 } else {
-                    ret = Err(err.clone());
+                    Err(mbs_err)
                 }
-                self.reset();
             }
-            ModbusState::InTrans(err) => {
-                let err = err.clone();
-                ret = Err(err.clone());
-                self.state = ModbusState::WaitForT3_5(err);
+            ModbusState::InTrans(mbs_err) => {
+                self.state = ModbusState::WaitForT3_5(mbs_err);
+                Err(mbs_err)
             }
-            ModbusState::Idle => (),
+            ModbusState::Idle => Err(ModbusStateError::None),
         }
-
-        //defmt::println!("MB_TMR: {} V: {} T: {}", self.state, valid, self.tmr.is_some());
-
-        ret
     }
 }
 
@@ -213,7 +208,7 @@ pub fn create_request(buf: &mut [u8], addr: u8, reg: u16, len: u8) -> Option<Non
     buf[2..4].copy_from_slice(reg.to_be_bytes().as_slice());
     buf[4..6].copy_from_slice(u16::from(len).to_be_bytes().as_slice());
 
-    let crc = calc_crc(&buf[0..6]);
+    let crc = crc16(&buf[0..6]);
     buf[6..8].copy_from_slice(crc.to_le_bytes().as_slice());
 
     NonZeroU8::new(8)
@@ -222,8 +217,7 @@ pub fn create_request(buf: &mut [u8], addr: u8, reg: u16, len: u8) -> Option<Non
 #[cfg(test)]
 mod test {
     use super::{
-        calc_crc, create_request, Modbus, ModbusAddr, ModbusError, ModbusState, ModbusStateError,
-        MODBUS_FRAME_LEN_MAX,
+        create_request, Modbus, ModbusAddr, ModbusState, ModbusStateError, MODBUS_FRAME_LEN_MAX,
     };
     use core::num::NonZeroU8;
 
