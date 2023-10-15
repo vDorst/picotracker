@@ -12,6 +12,7 @@
 
 use core::cell::RefCell;
 use core::f32::consts::PI;
+use core::fmt::write;
 use core::num::NonZeroI8;
 
 use defmt::*;
@@ -392,13 +393,59 @@ pub enum ModBusTypes {
     Char8Array32,
 }
 
-#[derive(Debug, Format)]
+#[derive(Debug)]
 pub enum ModBusTypesDecode {
     Uint32(u32),
     Uint48(u64),
     Uint16(u16),
     Uint8(u8),
     Char8Array32([u8; 32]),
+}
+
+impl defmt::Format for ModBusTypesDecode {
+    fn format(&self, fmt: Formatter) {
+        match self {
+            ModBusTypesDecode::Uint32(val) => val.format(fmt),
+            ModBusTypesDecode::Uint48(val) => val.format(fmt),
+            ModBusTypesDecode::Uint16(val) => val.format(fmt),
+            ModBusTypesDecode::Uint8(val) => val.format(fmt),
+            ModBusTypesDecode::Char8Array32(val) => {
+                let mut buf: [u8; 32] = val.clone();
+                let null = buf.iter().position(|c| *c == b'\0').unwrap_or(val.len());
+                let data = &mut buf[0..null];
+                data.iter_mut().for_each(|c| {
+                    if !c.is_ascii() {
+                        *c = b'?';
+                    }
+                });
+                let s = unsafe { core::str::from_utf8_unchecked(data) };
+                s.format(fmt)
+            }
+        }
+    }
+}
+
+impl core::fmt::Display for ModBusTypesDecode {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            ModBusTypesDecode::Uint32(val) => f.write_fmt(format_args!("{val}")),
+            ModBusTypesDecode::Uint48(val) => f.write_fmt(format_args!("{val}")),
+            ModBusTypesDecode::Uint16(val) => f.write_fmt(format_args!("{val}")),
+            ModBusTypesDecode::Uint8(val) => f.write_fmt(format_args!("{val}")),
+            ModBusTypesDecode::Char8Array32(val) => {
+                let mut buf: [u8; 32] = val.clone();
+                let null = buf.iter().position(|c| *c == b'\0').unwrap_or(val.len());
+                let data = &mut buf[0..null];
+                data.iter_mut().for_each(|c| {
+                    if !c.is_ascii() {
+                        *c = b'?';
+                    }
+                });
+                let s = unsafe { core::str::from_utf8_unchecked(data) };
+                f.write_str(s)
+            }
+        }
+    }
 }
 
 #[repr(u8)]
@@ -492,10 +539,10 @@ const RUN_TIME_VARIABLES: [MBR; 10] = [
 
 #[embassy_executor::task]
 async fn modbus_handle(mut uart: Uart<'static, peripherals::UART1, UartAsync>) {
-    let mut mb = Modbus::new(ModbusAddr::new(Some(1)).unwrap());
+    let mut mb = Modbus::<40>::new(ModbusAddr::new(Some(1)).unwrap());
 
     let mut buf = [0_u8; 16];
-    let mut tick = Ticker::every(Duration::from_secs(3));
+    let mut tick = Ticker::every(Duration::from_secs(5));
 
     // let mut regs = RUN_TIME_VARIABLES.iter().cycle();
     loop {
@@ -503,7 +550,7 @@ async fn modbus_handle(mut uart: Uart<'static, peripherals::UART1, UartAsync>) {
 
         defmt::info!("MB: Readout!");
         for (reg, ty, name) in RUN_TIME_VARIABLES {
-            // defmt::println!("MB Send request for {}({}) no: {}", name, reg, ty.register_no());
+            // defmt::println!("### MB Send request for {}[{:04x}] no: {}", name, reg, ty.register_no());
             if let Some(req) = create_request(&mut buf, 1, reg, ty.register_no()) {
                 let size: usize = usize::from(u8::from(req));
                 if let Err(e) = uart.write(&buf[0..size]).await {
@@ -521,11 +568,16 @@ async fn modbus_handle(mut uart: Uart<'static, peripherals::UART1, UartAsync>) {
                                 match ret {
                                     Ok(()) => {
                                         let byte = buf[0];
-                                        // info!("MB Put {:02x}", byte);
-                                        mb.char_recv(byte);
+                                        mb.serial_recv(byte);
                                     }
                                     Err(e) => {
-                                        println!("MB E {:?}", e);
+                                        let ser_err = match e {
+                                            embassy_rp::uart::Error::Overrun => ModbusError::OverRun,
+                                            embassy_rp::uart::Error::Parity => ModbusError::Parity,
+                                            _ => ModbusError::Frame,
+                                        };
+                                        mb.serial_error(ser_err);
+                                        println!("MB UART E {:?}", e);
                                         break;
                                     }
                                 }
@@ -537,22 +589,28 @@ async fn modbus_handle(mut uart: Uart<'static, peripherals::UART1, UartAsync>) {
                                     break;
                                 }
                                 match mb.timer_handle() {
-                                    Err(e) => {
-                                        if !matches!(e, ModbusError::None) {
-                                            break;
-                                        }
-                                        // println!("MB E {:?}", e);
+                                    None => (),
+                                    Some(Err(e)) => {
+                                        error!("MB TE {:?}", e);
+                                        break;
                                     }
-                                    Ok(v) => {
-                                        let data = &mb.buf[0..usize::from(v)];
-                                        println!(
-                                            "MB DATA: {=str}[{}]: {} NO {} {:02x}",
-                                            name,
-                                            reg,
-                                            ty.parse(data),
-                                            ty.register_no(),
-                                            data,
-                                        );
+                                    Some(Ok(v)) => {
+                                        let data = &mb.buf[0..usize::from(u8::from(v))];
+                                        let val = ty.parse(data);
+                                        match val {
+                                            Ok(v) => {
+                                                println!("MB DATA: {=str}[{}]: {} {:02x}", name, reg, v, data,)
+                                            }
+                                            Err(e) => println!(
+                                                "MB DATA: {=str}[{}]: {} NO {} {:02x}",
+                                                name,
+                                                reg,
+                                                e,
+                                                ty.register_no(),
+                                                data,
+                                            ),
+                                        }
+
                                         break;
                                     }
                                 }
