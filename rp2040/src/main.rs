@@ -539,7 +539,7 @@ const RUN_TIME_VARIABLES: [MBR; 10] = [
 
 #[embassy_executor::task]
 async fn modbus_handle(mut uart: Uart<'static, peripherals::UART1, UartAsync>) {
-    let mut mb = Modbus::<40>::new(ModbusAddr::new(Some(1)).unwrap());
+    let mut mb = Modbus::<40>::new(ModbusAddr::new(1).unwrap());
 
     let mut buf = [0_u8; 16];
     let mut tick = Ticker::every(Duration::from_secs(5));

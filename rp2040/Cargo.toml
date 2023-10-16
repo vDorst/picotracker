@@ -55,4 +55,5 @@ dotenvy = "0.15.7"
 [profile.release]
 debug = 2
 codegen-units = 1
-opt-level = 's'
+#opt-level = 's'
+opt-level = 3
