@@ -143,6 +143,42 @@ impl<const N: usize> Modbus<N> {
         }
     }
 
+    /// Should be called by the UART RX interrupt
+    pub fn serial_recv_from_slice(&mut self, data: &[u8]) {
+        match &mut self.state {
+            ModbusState::Idle => {
+                if data.is_empty() {
+                    return;
+                }
+                self.state = if data.len() > N {
+                    ModbusState::Emission(ModbusError::FrameTooLong)
+                } else if self.accept_address(data[0]) {
+                    self.buf[0..data.len()].copy_from_slice(data);
+                    ModbusState::Reception(u8::try_from(data.len() - 1).unwrap())
+                } else {
+                    ModbusState::Emission(ModbusError::AddressNorOurs)
+                };
+            }
+            ModbusState::Reception(idx) => {
+                if data.is_empty() {
+                    return;
+                }
+                let idx_real = usize::from(*idx) + 1;
+                let end = idx_real + data.len();
+                if end <= N {
+                    self.buf[idx_real..end].copy_from_slice(data);
+                    *idx = u8::try_from(end - 1).unwrap();
+                } else {
+                    self.state = ModbusState::Emission(ModbusError::FrameTooLong);
+                }
+            }
+            ModbusState::Emission(_) => (),
+            ModbusState::WaitForT3_5(_) => {
+                self.state = ModbusState::Emission(ModbusError::MoreDataWithinT35Wait);
+            }
+        }
+    }
+
     /// Should be called by the UART RX interrupt incase of an serial error
     /// Error is ignored when `Idle` or there is already an error or `WaitForT3_5`.
     pub fn serial_error(&mut self, mbs_err: ModbusError) {
@@ -424,5 +460,122 @@ mod test {
     #[should_panic = "Buffer must between 5..=256"]
     fn create_object_buffer_too_large() {
         let _ = Modbus::<257>::new(ModbusAddr(NonZeroU8::new(0x01)));
+    }
+
+    #[test]
+    fn as_slice_packet_too_short() {
+        let mut mb = Modbus::<32>::new(ModbusAddr(NonZeroU8::new(0x01)));
+
+        assert_eq!(mb.state, ModbusState::Idle);
+
+        mb.serial_recv_from_slice(&VALID_TEST_LONG[0..4]);
+
+        assert_eq!(mb.state, ModbusState::Reception(3));
+
+        assert_eq!(mb.timer_handle(), None);
+        assert_eq!(
+            mb.state,
+            ModbusState::WaitForT3_5(Err(ModbusError::TooShort))
+        );
+        assert_eq!(mb.timer_handle(), Some(Err(ModbusError::TooShort)));
+        assert_eq!(mb.state, ModbusState::Idle);
+    }
+
+    #[test]
+    fn as_slice_packet_max_packet() {
+        let mut mb = Modbus::<256>::new(ModbusAddr(NonZeroU8::new(0x01)));
+
+        mb.serial_recv_from_slice(VALID_TEST_LONG);
+
+        assert_eq!(mb.state, ModbusState::Reception(u8::MAX));
+        assert_eq!(mb.timer_handle(), None);
+
+        assert_eq!(
+            mb.state,
+            ModbusState::WaitForT3_5(Ok(NonZeroU8::new(254).unwrap()))
+        );
+        assert_eq!(mb.timer_handle(), Some(Ok(NonZeroU8::new(254).unwrap())));
+
+        assert_eq!(mb.state, ModbusState::Idle);
+
+        let (part_a, part_b) = VALID_TEST_LONG.split_at(128);
+        mb.serial_recv_from_slice(part_a);
+
+        assert_eq!(mb.state, ModbusState::Reception(127));
+
+        mb.serial_recv_from_slice(part_b);
+
+        assert_eq!(mb.state, ModbusState::Reception(u8::MAX));
+        assert_eq!(mb.timer_handle(), None);
+
+        assert_eq!(
+            mb.state,
+            ModbusState::WaitForT3_5(Ok(NonZeroU8::new(254).unwrap()))
+        );
+        assert_eq!(mb.timer_handle(), Some(Ok(NonZeroU8::new(254).unwrap())));
+
+        assert_eq!(mb.state, ModbusState::Idle);
+    }
+
+    #[test]
+    fn as_slice_packet_too_long() {
+        let mut mb = Modbus::<256>::new(ModbusAddr(NonZeroU8::new(0x01)));
+
+        mb.serial_recv_from_slice(VALID_TEST_LONG);
+
+        assert_eq!(mb.state, ModbusState::Reception(u8::MAX));
+
+        mb.serial_recv(0xFF);
+
+        assert_eq!(
+            mb.state,
+            ModbusState::Emission(crate::ModbusError::FrameTooLong)
+        );
+        assert_eq!(mb.timer_handle(), None);
+        assert_eq!(
+            mb.state,
+            ModbusState::WaitForT3_5(Err(ModbusError::FrameTooLong))
+        );
+
+        assert_eq!(mb.timer_handle(), Some(Err(ModbusError::FrameTooLong)));
+        assert_eq!(mb.state, ModbusState::Idle);
+
+        mb.serial_recv_from_slice(VALID_TEST_LONG);
+
+        assert_eq!(mb.state, ModbusState::Reception(u8::MAX));
+
+        mb.serial_recv_from_slice(VALID_TEST_LONG);
+
+        assert_eq!(
+            mb.state,
+            ModbusState::Emission(crate::ModbusError::FrameTooLong)
+        );
+        assert_eq!(mb.timer_handle(), None);
+        assert_eq!(
+            mb.state,
+            ModbusState::WaitForT3_5(Err(ModbusError::FrameTooLong))
+        );
+
+        assert_eq!(mb.timer_handle(), Some(Err(ModbusError::FrameTooLong)));
+        assert_eq!(mb.state, ModbusState::Idle);
+
+        mb.serial_recv(0x01);
+
+        assert_eq!(mb.state, ModbusState::Reception(0));
+
+        mb.serial_recv_from_slice(VALID_TEST_LONG);
+
+        assert_eq!(
+            mb.state,
+            ModbusState::Emission(crate::ModbusError::FrameTooLong)
+        );
+        assert_eq!(mb.timer_handle(), None);
+        assert_eq!(
+            mb.state,
+            ModbusState::WaitForT3_5(Err(ModbusError::FrameTooLong))
+        );
+
+        assert_eq!(mb.timer_handle(), Some(Err(ModbusError::FrameTooLong)));
+        assert_eq!(mb.state, ModbusState::Idle);
     }
 }
