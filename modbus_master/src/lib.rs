@@ -5,13 +5,10 @@
 #![allow(clippy::missing_panics_doc)]
 
 use core::num::NonZeroU8;
-use core::ops::RangeInclusive;
 
 /// Minimal Modbus Frame Length `<ADDR> <FUNC+0x80> <ERRORCODE> <CRC_HIGH> <CRC_LOW>`
 const MODBUS_FRAME_LEN_MIN: u8 = 5;
 
-/// Valid Modbus address range
-const MODBUS_ADDR_RANGE: RangeInclusive<u8> = 1..=247;
 /// Modbus broadcast address
 const MODBUS_ADDR_BROADCAST: u8 = 0;
 
@@ -19,11 +16,11 @@ const MODBUS_ADDR_BROADCAST: u8 = 0;
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum ModbusError {
     /// Our address don´t match
-    InvalidAddr,
+    AddressNorOurs,
     /// Received some data in t3.5 wait time.
     MoreDataWithinT35Wait,
     /// Received more data then our buffer
-    TooLong,
+    FrameTooLong,
     /// Received too less data
     TooShort,
     /// Crc don´t match
@@ -78,24 +75,29 @@ pub fn crc16(data: &[u8]) -> u16 {
 
 pub struct ModbusAddr(Option<NonZeroU8>);
 
+#[derive(Debug)]
+pub enum ModbusAddrError {
+    InvalidAddr,
+}
+
 impl ModbusAddr {
     /// Validates modbus address
-    pub fn new(addr: Option<u8>) -> Option<Self> {
-        if addr.is_some_and(|addr| !MODBUS_ADDR_RANGE.contains(&(addr))) {
-            return None;
+    pub fn new(addr: u8) -> Result<Self, ModbusAddrError> {
+        if addr > 247 {
+            return Err(ModbusAddrError::InvalidAddr);
         }
-        let addr = addr.and_then(NonZeroU8::new);
-        Some(Self(addr))
+        Ok(Self(NonZeroU8::new(addr)))
     }
 }
 
 impl<const N: usize> Modbus<N> {
     #[must_use]
     pub fn new(addr: ModbusAddr) -> Self {
+        assert!(N >= 5 && N <= 256, "Buffer must between 5..=256");
         Self {
             buf: [0; N],
-            addr,
             state: ModbusState::default(),
+            addr,
         }
     }
 
@@ -123,7 +125,7 @@ impl<const N: usize> Modbus<N> {
                     self.buf[0] = data;
                     ModbusState::Reception(0)
                 } else {
-                    ModbusState::Emission(ModbusError::InvalidAddr)
+                    ModbusState::Emission(ModbusError::AddressNorOurs)
                 };
             }
             ModbusState::Reception(idx) => {
@@ -131,7 +133,7 @@ impl<const N: usize> Modbus<N> {
                     *idx += 1;
                     self.buf[usize::from(*idx)] = data;
                 } else {
-                    self.state = ModbusState::Emission(ModbusError::TooLong);
+                    self.state = ModbusState::Emission(ModbusError::FrameTooLong);
                 }
             }
             ModbusState::Emission(_) => (),
@@ -338,14 +340,17 @@ mod test {
         }
         mb.serial_recv(0xFF);
 
-        assert_eq!(mb.state, ModbusState::Emission(crate::ModbusError::TooLong));
+        assert_eq!(
+            mb.state,
+            ModbusState::Emission(crate::ModbusError::FrameTooLong)
+        );
         assert_eq!(mb.timer_handle(), None);
         assert_eq!(
             mb.state,
-            ModbusState::WaitForT3_5(Err(ModbusError::TooLong))
+            ModbusState::WaitForT3_5(Err(ModbusError::FrameTooLong))
         );
 
-        assert_eq!(mb.timer_handle(), Some(Err(ModbusError::TooLong)));
+        assert_eq!(mb.timer_handle(), Some(Err(ModbusError::FrameTooLong)));
         assert_eq!(mb.state, ModbusState::Idle);
     }
 
@@ -408,5 +413,16 @@ mod test {
         assert_eq!(mb.timer_handle(), Some(Err(ModbusError::Parity)));
 
         assert_eq!(mb.state, ModbusState::Idle);
+    }
+
+    #[test]
+    #[should_panic = "Buffer must between 5..=256"]
+    fn create_object_buffer_too_small() {
+        let _ = Modbus::<4>::new(ModbusAddr(NonZeroU8::new(0x01)));
+    }
+    #[test]
+    #[should_panic = "Buffer must between 5..=256"]
+    fn create_object_buffer_too_large() {
+        let _ = Modbus::<257>::new(ModbusAddr(NonZeroU8::new(0x01)));
     }
 }
