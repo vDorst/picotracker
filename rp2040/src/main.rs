@@ -8,7 +8,6 @@
 #![feature(type_alias_impl_trait)]
 #![allow(unused_imports)]
 #![feature(try_blocks)]
-#![feature(async_fn_in_trait)]
 
 use core::cell::RefCell;
 use core::f32::consts::PI;
@@ -86,15 +85,14 @@ type LoraStatus = String<16>;
 
 #[embassy_executor::task]
 async fn lora_task(
-    lora_spi: SpiBusWithConfig<'static, NoopRawMutex, Spi<'static, SPI1, Async>>,
+    lora_spi: SpiDeviceWithConfig<'static, NoopRawMutex, Spi<'static, SPI1, Async>, Output<'static, AnyPin>>,
     lora_data_recv: Receiver<'static, NoopRawMutex, LoraType, 1>,
     lora_status_send: Sender<'static, NoopRawMutex, LoraStatus, 1>,
-    nss: Output<'static, AnyPin>,
     reset: Output<'static, AnyPin>,
     dio1: Input<'static, AnyPin>,
     busy: Input<'static, AnyPin>,
 ) {
-    let iv = GenericSx126xInterfaceVariant::new(nss, reset, dio1, busy, None, None).unwrap();
+    let iv = GenericSx126xInterfaceVariant::new(reset, dio1, busy, None, None).unwrap();
 
     let lora = {
         match LoRa::new(
@@ -146,7 +144,7 @@ async fn lora_task(
             }
         };
 
-        Timer::after(Duration::from_secs(5)).await;
+        Timer::after(Duration::from_secs(10)).await;
     }
 
     loop {
@@ -245,7 +243,7 @@ async fn display_task(
     bl.set_high();
 
     let center = Point::new(80 - 1, 40 - 1);
-    let mut frame = Ticker::every(Duration::from_hz(10));
+    let mut frame = Ticker::every(Duration::from_hz(1));
     let mut ret: f32;
 
     let mut col_iter = [Rgb565::RED, Rgb565::GREEN, Rgb565::BLUE].into_iter().cycle();
@@ -679,7 +677,7 @@ async fn main(spawner: Spawner) {
     let clk = p.PIN_10;
 
     let mut lora_config = spi::Config::default();
-    lora_config.frequency = 1_000_000;
+    lora_config.frequency = 12_000_000;
     lora_config.phase = spi::Phase::CaptureOnSecondTransition;
     lora_config.polarity = spi::Polarity::IdleHigh;
 
@@ -728,10 +726,13 @@ async fn main(spawner: Spawner) {
     let dio1 = Input::new(p.PIN_20.degrade(), Pull::None);
     let busy = Input::new(p.PIN_2.degrade(), Pull::None);
 
-    let lora_spi: SpiBusWithConfig<'_, NoopRawMutex, Spi<'_, SPI1, Async>> =
-        SpiBusWithConfig::new(spi_bus, lora_config);
+    // let lora_spi: SpiDeviceWithConfig::new( <'_, NoopRawMutex, Spi<'_, SPI1, Async>> =
+    //     SpiBusWithConfig::new(spi_bus, lora_config);
 
-    spawner.must_spawn(lora_task(lora_spi, lora_recv, lorast_send, nss, reset, dio1, busy));
+    let lora_spi: SpiDeviceWithConfig<'_, NoopRawMutex, Spi<'_, SPI1, Async>, Output<'_, AnyPin>> =
+        SpiDeviceWithConfig::new(spi_bus, nss, lora_config.clone());
+
+    spawner.must_spawn(lora_task(lora_spi, lora_recv, lorast_send, reset, dio1, busy));
 
     let mut counter: u32 = 0xDEADBEAF;
 
@@ -746,71 +747,7 @@ async fn main(spawner: Spawner) {
     }
 }
 
-pub struct SpiBusWithConfig<'a, M: RawMutex, BUS: SetConfig> {
-    bus: &'a Mutex<M, BUS>,
-    config: BUS::Config,
-}
-
-impl<'a, M: RawMutex, BUS: SetConfig> SpiBusWithConfig<'a, M, BUS> {
-    /// Create a new `SpiDeviceWithConfig`.
-    pub fn new(bus: &'a Mutex<M, BUS>, config: BUS::Config) -> Self {
-        Self { bus, config }
-    }
-}
-
-impl<'a, M, BUS> embedded_hal_async::spi::ErrorType for SpiBusWithConfig<'a, M, BUS>
-where
-    BUS: embedded_hal_async::spi::ErrorType + SetConfig,
-    M: RawMutex,
-{
-    type Error = BUS::Error;
-}
-
-impl<M, BUS> embedded_hal_async::spi::SpiBus for SpiBusWithConfig<'_, M, BUS>
-where
-    M: RawMutex,
-    BUS: embedded_hal_async::spi::SpiBus + SetConfig,
-{
-    async fn read(&mut self, words: &mut [u8]) -> Result<(), Self::Error> {
-        let mut bus = self.bus.lock().await;
-        let _ = bus.set_config(&self.config);
-
-        bus.read(words).await
-    }
-
-    async fn write(&mut self, words: &[u8]) -> Result<(), Self::Error> {
-        let mut bus = self.bus.lock().await;
-        let _ = bus.set_config(&self.config);
-
-        bus.write(words).await
-    }
-
-    async fn transfer(&mut self, read: &mut [u8], write: &[u8]) -> Result<(), Self::Error> {
-        let mut bus = self.bus.lock().await;
-        let _ = bus.set_config(&self.config);
-
-        bus.transfer(read, write).await
-    }
-
-    async fn transfer_in_place(&mut self, words: &mut [u8]) -> Result<(), Self::Error> {
-        let mut bus = self.bus.lock().await;
-        let _ = bus.set_config(&self.config);
-
-        bus.transfer_in_place(words).await
-    }
-
-    async fn flush(&mut self) -> Result<(), Self::Error> {
-        let mut bus = self.bus.lock().await;
-
-        bus.flush().await
-    }
-}
-
 use core::convert::TryInto;
 
 use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::{Circle, PrimitiveStyle};
-
-/// SPI communication error
-#[derive(Debug)]
-struct CommError;
