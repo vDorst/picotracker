@@ -52,7 +52,7 @@ use lora_phy::sx1261_2::SX1261_2;
 use lora_phy::LoRa;
 use lorawan::default_crypto::DefaultFactory as Crypto;
 use lorawan_device::async_device::lora_radio::LoRaRadio;
-use lorawan_device::async_device::{Device, JoinMode};
+use lorawan_device::async_device::{Device, JoinMode, JoinResponse, SendResponse};
 use lorawan_device::{region, AppEui, AppKey, DevEui};
 use micromath::F32Ext;
 use mipidsi::asynch::models::Model;
@@ -119,7 +119,7 @@ async fn lora_task(
 
     loop {
         defmt::info!("Joining LoRaWAN network");
-        let msg: LoraStatus = "Lora: Try join.".into();
+        let msg: LoraStatus = "Lora: Try join. ".into();
 
         lora_status_send.send(msg).await;
 
@@ -131,16 +131,23 @@ async fn lora_task(
             })
             .await
         {
-            Ok(()) => {
-                defmt::info!("LoRaWAN network joined");
-                let msg: LoraStatus = "Lora: joined".into();
+            Ok(resp) => {
+                let msg = match resp {
+                    JoinResponse::JoinSuccess => "Lora: Joined    ",
+                    JoinResponse::NoJoinAccept => "Lora: NoJoin    ",
+                };
+                defmt::info!("LoRaWAN network: {}", msg);
+                let msg: LoraStatus = msg.into();
                 lora_status_send.send(msg).await;
                 break;
             }
             Err(err) => {
-                info!("Radio error = {}", err);
-                let msg: LoraStatus = "Lora: join Err".into();
-                lora_status_send.send(msg).await;
+                println!("Lora: Error: {:?}", err);
+                let msg = match err {
+                    lorawan_device::async_device::Error::Radio(e) => "Lora: SErr: Rad.",
+                    lorawan_device::async_device::Error::Mac(e) => "Lora: SErr: Mac.",
+                };
+                lora_status_send.send(msg.into()).await;
             }
         };
 
@@ -153,13 +160,26 @@ async fn lora_task(
         let ret = device.send(&data, 1, false).await;
 
         let msg = match ret {
-            Ok(()) => {
+            Ok(resp) => {
+                let msg = match resp {
+                    SendResponse::NoAck => "Lora: NoAck     ",
+                    SendResponse::SessionExpired => "Lora: SessionExp",
+                    SendResponse::DownlinkReceived(e) => "Lora: GotRec    ",
+                    SendResponse::RxComplete => "Lora: RxComplete",
+                };
+                defmt::info!("LoRaWAN network: {}", msg);
+                let msg: LoraStatus = msg.into();
                 println!("Send Done");
                 "Lora: Sended".into()
             }
             Err(e) => {
-                println!("Error: {:?}", e);
-                "Lora: Send Err".into()
+                println!("Lora: Error: {:?}", e);
+                let msg = match e {
+                    lorawan_device::async_device::Error::Radio(e) => "Lora: SErr: Rad.",
+                    lorawan_device::async_device::Error::Mac(e) => "Lora: SErr: Mac.",
+                };
+
+                msg.into()
             }
         };
 
