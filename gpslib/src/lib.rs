@@ -1,7 +1,6 @@
 // This file is based on https://github.com/MechanicalPython/adafruit_gps
 #![deny(clippy::pedantic)]
-#![feature(async_fn_in_trait)]
-#![cfg_attr(not(any(test, feature = "std")), no_std)]
+#![no_std]
 #![allow(clippy::module_name_repetitions)]
 #![allow(clippy::missing_errors_doc)]
 #![allow(clippy::missing_panics_doc)]
