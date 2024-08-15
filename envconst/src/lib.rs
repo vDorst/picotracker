@@ -1,7 +1,8 @@
 #![no_std]
-//#![feature(const_trait_impl)]
+#![deny(clippy::pedantic)]
 
 /// Convert HEX str into array [u8; N]
+#[must_use]
 pub const fn hex_to_u8<const N: usize>(input: &str) -> [u8; N] {
     let mut ret = [0; N];
 
@@ -30,6 +31,7 @@ pub const fn hex_to_u8<const N: usize>(input: &str) -> [u8; N] {
 }
 
 /// Reverse the order of an array
+#[must_use]
 pub const fn reverse<const N: usize>(input: [u8; N]) -> [u8; N] {
     let mut ret = [0; N];
 
