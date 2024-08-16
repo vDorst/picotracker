@@ -3,7 +3,7 @@ name = "picotracker"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-rust-version = "1.73"
+rust-version = "1.80"
 
 [workspace]
 members = [
@@ -13,3 +13,9 @@ members = [
     "envconst"
 ]
 resolver = "2"
+
+[profile.release]
+debug = 2
+opt-level = 'z'
+codegen-units = 1
+overflow-checks = true

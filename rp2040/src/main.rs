@@ -5,9 +5,8 @@
 
 #![no_std]
 #![no_main]
-#![feature(type_alias_impl_trait)]
 #![allow(unused_imports)]
-#![feature(try_blocks)]
+// #![feature(try_blocks)]
 
 use core::cell::RefCell;
 use core::f32::consts::PI;
@@ -15,15 +14,11 @@ use core::fmt::write;
 use core::num::NonZeroI8;
 
 use defmt::*;
-use display_interface::prelude::*;
-use display_interface_spi::SPIInterface;
 use embassy_embedded_hal::shared_bus::asynch::spi::SpiDeviceWithConfig;
 use embassy_embedded_hal::shared_bus::SpiDeviceError;
 use embassy_embedded_hal::SetConfig;
 use embassy_executor::Spawner;
 use embassy_futures::select::{select, Either};
-use embassy_lora::iv::GenericSx126xInterfaceVariant;
-use embassy_lora::LoraTimer;
 use embassy_rp::gpio::{AnyPin, Input, Level, Output, Pin, Pull};
 use embassy_rp::peripherals::SPI1;
 use embassy_rp::spi::{self, Async, Blocking, Config, Spi};
@@ -33,10 +28,9 @@ use embassy_sync::blocking_mutex::raw::{NoopRawMutex, RawMutex};
 use embassy_sync::channel::{Channel, Receiver, Sender};
 use embassy_sync::mutex::Mutex;
 use embassy_time::{Delay, Duration, Ticker, Timer};
-use embedded_graphics::framebuffer::{buffer_size, Framebuffer};
 use embedded_graphics::image::{GetPixel, Image, ImageRawLE};
 use embedded_graphics::mono_font::{ascii, MonoTextStyle};
-use embedded_graphics::pixelcolor::raw::LittleEndian;
+use embedded_graphics::pixelcolor::raw::{LittleEndian, RawU16};
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::{Line, PrimitiveStyleBuilder, Rectangle};
@@ -47,28 +41,29 @@ use embedded_io_async::{Read, Write};
 use gpslib::chrono::{Datelike, FixedOffset, TimeZone, Timelike};
 use gpslib::{Gps, GpsRmc, PosMode};
 use heapless::{String, Vec};
-use lora_phy::mod_params::*;
-use lora_phy::sx1261_2::SX1261_2;
+
+use lora_phy::iv::GenericSx126xInterfaceVariant;
+use lora_phy::lorawan_radio::LorawanRadio;
+use lora_phy::sx126x::{self, Sx1261, Sx1262, Sx126x, TcxoCtrlVoltage};
 use lora_phy::LoRa;
-use lorawan::default_crypto::DefaultFactory as Crypto;
-use lorawan_device::async_device::lora_radio::LoRaRadio;
-use lorawan_device::async_device::{Device, JoinMode, JoinResponse, SendResponse};
-use lorawan_device::{region, AppEui, AppKey, DevEui};
+use lorawan_device::async_device::{region, Device, EmbassyTimer, JoinMode, JoinResponse, SendResponse};
+use lorawan_device::default_crypto::DefaultFactory as Crypto;
+use lorawan_device::{AppEui, AppKey, DevEui};
+
 use micromath::F32Ext;
-use mipidsi::asynch::models::Model;
-use mipidsi::models::ST7789;
-use mipidsi::{Builder, Display, ModelOptions, Orientation};
 use modbus_master::{create_request, Modbus, ModbusAddr, ModbusError};
-use static_cell::{make_static, StaticCell};
+use st7735_embassy::{ST7735, ST7735IF};
+use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
 const LORAWAN_REGION: region::Region = region::Region::EU868; // warning: set this appropriately for the region
+const MAX_TX_POWER: u8 = 14;
 
 const LORAWAN_DEVEUI: [u8; 8] = envconst::reverse(envconst::hex_to_u8::<8>(env!("DEVEUI")));
 const LORAWAN_APPEUI: [u8; 8] = envconst::reverse(envconst::hex_to_u8::<8>(env!("APPEUI")));
 const LORAWAN_APPKEY: [u8; 16] = envconst::hex_to_u8::<16>(env!("APPKEY"));
 
-const DISPLAY_FREQ: u32 = 64_000_000;
+const DISPLAY_FREQ: u32 = 12_000_000;
 const FB_SIZE: (usize, usize) = (160, 80);
 
 bind_interrupts!(struct Irqs {
@@ -83,25 +78,32 @@ type GpsSend = Sender<'static, NoopRawMutex, GpsType, 1>;
 type LoraType = Vec<u8, 48>;
 type LoraStatus = String<16>;
 
+type SpiDev = SpiDeviceWithConfig<'static, NoopRawMutex, Spi<'static, SPI1, Async>, Output<'static>>;
+use core::convert::TryInto;
+
+use embedded_graphics::prelude::*;
+use embedded_graphics::primitives::{Circle, PrimitiveStyle};
+
 #[embassy_executor::task]
 async fn lora_task(
-    lora_spi: SpiDeviceWithConfig<'static, NoopRawMutex, Spi<'static, SPI1, Async>, Output<'static, AnyPin>>,
+    lora_spi: SpiDeviceWithConfig<'static, NoopRawMutex, Spi<'static, SPI1, Async>, Output<'static>>,
     lora_data_recv: Receiver<'static, NoopRawMutex, LoraType, 1>,
     lora_status_send: Sender<'static, NoopRawMutex, LoraStatus, 1>,
-    reset: Output<'static, AnyPin>,
-    dio1: Input<'static, AnyPin>,
-    busy: Input<'static, AnyPin>,
+    reset: Output<'static>,
+    dio1: Input<'static>,
+    busy: Input<'static>,
 ) {
+    let config = sx126x::Config {
+        chip: Sx1262,
+        tcxo_ctrl: Some(TcxoCtrlVoltage::Ctrl1V7),
+        use_dcdc: true,
+        rx_boost: false,
+    };
+
     let iv = GenericSx126xInterfaceVariant::new(reset, dio1, busy, None, None).unwrap();
 
     let lora = {
-        match LoRa::new(
-            SX1261_2::new(BoardType::RpPicoWaveshareSx1262, lora_spi, iv),
-            true,
-            Delay,
-        )
-        .await
-        {
+        match LoRa::new(Sx126x::new(lora_spi, iv, config), true, Delay).await {
             Ok(l) => l,
             Err(err) => {
                 info!("Radio error = {}", err);
@@ -110,16 +112,17 @@ async fn lora_task(
         }
     };
 
-    let radio = LoRaRadio::new(lora);
+    let radio: LorawanRadio<_, _, { MAX_TX_POWER }> = lora.into();
     let region: region::Configuration = region::Configuration::new(LORAWAN_REGION);
 
-    let mut device: Device<_, Crypto, _, _> = Device::new(region, radio, LoraTimer::new(), embassy_rp::clocks::RoscRng);
+    let mut device: Device<_, Crypto, _, _> =
+        Device::new(region, radio, EmbassyTimer::new(), embassy_rp::clocks::RoscRng);
 
-    device.set_datarate(region::DR::_4);
+    // device.set_datarate(region::DR::_4);
 
     loop {
         defmt::info!("Joining LoRaWAN network");
-        let msg: LoraStatus = "Lora: Try join. ".into();
+        let msg: LoraStatus = "Lora: Try join. ".try_into().unwrap();
 
         lora_status_send.send(msg).await;
 
@@ -137,7 +140,7 @@ async fn lora_task(
                     JoinResponse::NoJoinAccept => "Lora: NoJoin    ",
                 };
                 defmt::info!("LoRaWAN network: {}", msg);
-                let msg: LoraStatus = msg.into();
+                let msg: LoraStatus = msg.try_into().unwrap();
                 lora_status_send.send(msg).await;
                 break;
             }
@@ -147,7 +150,7 @@ async fn lora_task(
                     lorawan_device::async_device::Error::Radio(e) => "Lora: SErr: Rad.",
                     lorawan_device::async_device::Error::Mac(e) => "Lora: SErr: Mac.",
                 };
-                lora_status_send.send(msg.into()).await;
+                lora_status_send.send(msg.try_into().unwrap()).await;
             }
         };
 
@@ -159,7 +162,7 @@ async fn lora_task(
         let data = lora_data_recv.receive().await;
         let ret = device.send(&data, 1, false).await;
 
-        let msg = match ret {
+        let msg: &str = match ret {
             Ok(resp) => {
                 let msg = match resp {
                     SendResponse::NoAck => "Lora: NoAck     ",
@@ -168,9 +171,9 @@ async fn lora_task(
                     SendResponse::RxComplete => "Lora: RxComplete",
                 };
                 defmt::info!("LoRaWAN network: {}", msg);
-                let msg: LoraStatus = msg.into();
+                // let msg: LoraStatus = msg.try_into().unwrap();
                 println!("Send Done");
-                "Lora: Sended".into()
+                "Lora: Sended"
             }
             Err(e) => {
                 println!("Lora: Error: {:?}", e);
@@ -179,11 +182,15 @@ async fn lora_task(
                     lorawan_device::async_device::Error::Mac(e) => "Lora: SErr: Mac.",
                 };
 
-                msg.into()
+                msg
             }
         };
 
-        lora_status_send.send(msg).await;
+        if let Ok(msg) = msg.try_into() {
+            lora_status_send.send(msg).await;
+        } else {
+            error!("MSG: {} doesn't fit!", msg);
+        }
 
         println!("sleep 5 min");
         Timer::after(Duration::from_secs(5 * 60)).await;
@@ -192,74 +199,36 @@ async fn lora_task(
 
 #[embassy_executor::task]
 async fn display_task(
-    display_spi: SpiDeviceWithConfig<
-        'static,
-        NoopRawMutex,
-        Spi<'static, SPI1, Async>,
-        Output<'static, peripherals::PIN_9>,
-    >,
+    display: &'static mut Dsp,
     gps_recv: Receiver<'static, NoopRawMutex, GpsType, 1>,
-    gps_pps: Input<'static, peripherals::PIN_16>,
-    display_dcx: Output<'static, peripherals::PIN_8>,
-    display_rst: Output<'static, peripherals::PIN_13>,
-    mut bl: Output<'static, peripherals::PIN_25>,
+    gps_pps: Input<'static>,
+    mut bl: Output<'static>,
     lora_recv: Receiver<'static, NoopRawMutex, LoraStatus, 1>,
 ) {
-    // display interface abstraction from SPI and DC
-    let di = SPIInterface::new(display_spi, display_dcx);
-
     let mut delay = Delay;
-
-    // create driver, display.set_offset(1, 26);
-    let mut display = Builder::st7789(di)
-        .with_display_size(FB_SIZE.0 as u16, FB_SIZE.1 as u16)
-        .with_window_offset_handler(|_e| (1, 26))
-        .with_color_order(mipidsi::ColorOrder::Bgr)
-        .with_invert_colors(mipidsi::ColorInversion::Inverted)
-        .with_orientation(Orientation::LandscapeInverted(true))
-        .async_init(&mut delay, Some(display_rst))
-        .await
-        .unwrap();
-
-    let mut fb = Framebuffer::<
-        Rgb565,
-        _,
-        LittleEndian,
-        { FB_SIZE.0 },
-        { FB_SIZE.1 },
-        { buffer_size::<Rgb565>(FB_SIZE.0, FB_SIZE.1) },
-    >::new();
-
-    let data = fb.data_mut();
-    let pix_iter = unsafe { core::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u16, data.len() / 2) };
-    let _ = display
-        .async_set_pixels_raw(0, 0, FB_SIZE.0 as u16, FB_SIZE.1 as u16, pix_iter)
-        .await;
 
     let mut step: u8 = 0;
     let rad = 20.0;
 
     let mut g: GpsType;
-    let mut sp: String<25> = "No GPS update".into();
+    let mut sp: String<25> = "No GPS update".try_into().unwrap();
 
-    let mut lora_s: LoraStatus = "No LORA update".into();
+    let mut lora_s: LoraStatus = "No LORA update".try_into().unwrap();
 
     let area = Rectangle {
         top_left: Point::new(0, 0),
         size: Size::new(160, 80),
     };
-    let _ = fb.fill_solid(&area, Rgb565::BLACK);
+    let _ = display.fill_solid(&area, Rgb565::BLUE);
 
     let (ex, ey) = {
-        let s = fb.size();
+        let s = display.size();
         let x = s.width as u16 - 1;
         let y = s.height as u16 - 1;
         (x, y)
     };
 
-    let data = fb.data_mut();
-    let pix_iter = unsafe { core::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u16, data.len() / 2) };
-    let _ = display.async_set_pixels_raw(0, 0, ex, ey, pix_iter).await;
+    display.flush().await.unwrap();
     bl.set_high();
 
     let center = Point::new(80 - 1, 40 - 1);
@@ -275,8 +244,10 @@ async fn display_task(
         Point::new(0, (style.font.baseline + style.font.character_size.height) as i32),
         style,
     )
-    .draw(&mut fb)
+    .draw(display)
     .unwrap();
+
+    display.flush().await.unwrap();
 
     // loop
     loop {
@@ -293,9 +264,9 @@ async fn display_task(
             g = p;
 
             if matches!(g.pos_mode, PosMode::NoFix) || g.data.is_none() {
-                sp = "GPS: No Fix".into();
+                sp = "GPS: No Fix".try_into().unwrap();
             } else {
-                sp = "".into();
+                sp = "".try_into().unwrap();
                 let time = g.timedate.with_timezone(&FixedOffset::east_opt(2 * 3600).unwrap());
 
                 let hour = time.time().hour();
@@ -321,7 +292,7 @@ async fn display_task(
             }
         }
 
-        let _ = fb.fill_solid(
+        let _ = display.fill_solid(
             &Rectangle {
                 top_left: Point { x: 0, y: 0 },
                 size: Size::new(159, style.font.character_size.height),
@@ -329,7 +300,7 @@ async fn display_task(
             Rgb565::BLACK,
         );
         Text::new(&sp, Point::new(0, (style.font.baseline) as i32), style)
-            .draw(&mut fb)
+            .draw(display)
             .unwrap();
 
         let lora_txt = Text::new(
@@ -342,9 +313,9 @@ async fn display_task(
             .bounding_box()
             .resized_width(160, embedded_graphics::geometry::AnchorX::Right);
 
-        let _ = fb.fill_solid(&clear_rec, Rgb565::BLACK);
+        let _ = display.fill_solid(&clear_rec, Rgb565::BLACK);
 
-        lora_txt.draw(&mut fb).unwrap();
+        lora_txt.draw(display).unwrap();
 
         ret = f32::from(step) * PI * 2.0 / 60.0;
 
@@ -355,7 +326,7 @@ async fn display_task(
         // defmt::println!("x = {}, y = {}, {} {}", end.x, end.y, sx, sy);
 
         let line = Line::new(center, end).into_styled(PrimitiveStyle::with_stroke(col, 3));
-        unwrap!(line.draw(&mut fb));
+        unwrap!(line.draw(display));
 
         let gps_col = if gps_pps.is_high() {
             Rgb565::GREEN
@@ -363,19 +334,13 @@ async fn display_task(
             Rgb565::BLACK
         };
 
-        fb.set_pixel(Point::new(159, 0), gps_col);
+        display.set_pixel(159, 0, gps_col.into_storage());
 
-        let mut pix_iter = fb
-            .data()
-            .chunks_exact(2)
-            .map(|x| u16::from_le_bytes(x.try_into().unwrap()))
-            .collect::<Vec<u16, { 160 * 80 }>>();
+        display.flush().await.unwrap();
 
         frame.next().await;
-        let _ = display.async_set_pixels_raw(0, 0, ex, ey, &mut pix_iter).await;
-
         let line = Line::new(center, end).into_styled(PrimitiveStyle::with_stroke(Rgb565::BLACK, 3));
-        unwrap!(line.draw(&mut fb));
+        unwrap!(line.draw(display));
 
         step += 1;
     }
@@ -658,10 +623,19 @@ fn u32_to_double<const N: usize>(mut num: u32, st: &mut String<N>) {
 
 type SpiBusT = Mutex<NoopRawMutex, Spi<'static, SPI1, Async>>;
 
+type Dsp = ST7735<
+    SpiDeviceWithConfig<'static, NoopRawMutex, Spi<'static, SPI1, Async>, Output<'static>>,
+    Output<'static>,
+    Output<'static>,
+>;
+static DSP: StaticCell<Dsp> = StaticCell::new();
+static SPI_BUS: StaticCell<SpiBusT> = StaticCell::new();
+static GPS_CHANNEL: StaticCell<Channel<NoopRawMutex, GpsType, 1>> = StaticCell::new();
+static LORA_CHANNEL: StaticCell<Channel<NoopRawMutex, LoraType, 1>> = StaticCell::new();
+static LORASTATUS_CHANNEL: StaticCell<Channel<NoopRawMutex, LoraStatus, 1>> = StaticCell::new();
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    static SPI_BUS: StaticCell<SpiBusT> = StaticCell::new();
-
     let p = embassy_rp::init(Default::default());
     info!("Hello World!");
 
@@ -712,16 +686,18 @@ async fn main(spawner: Spawner) {
     // dcx: 0 = command, 1 = data
 
     // Enable LCD backlight
-    let bl = Output::new(bl, Level::Low);
+    let mut bl = Output::new(bl, Level::Low);
 
-    let gps_channel = make_static!(Channel::<NoopRawMutex, GpsType, 1>::new());
+    let gps_channel = GPS_CHANNEL.init(Channel::new());
     let gps_send = gps_channel.sender();
     let gps_recv = gps_channel.receiver();
 
+    info!("Hello2!");
+
     spawner.must_spawn(gps_handle(gps_uart, gps_send));
+    info!("Hello3!");
 
-    spawner.must_spawn(modbus_handle(mb_uart));
-
+    /// spawner.must_spawn(modbus_handle(mb_uart));
     let display_cs = Output::new(display_cs, Level::High);
 
     // create SPI
@@ -731,15 +707,55 @@ async fn main(spawner: Spawner) {
     display_config.polarity = spi::Polarity::IdleHigh;
     let display_spi = SpiDeviceWithConfig::new(spi_bus, display_cs, display_config.clone());
 
-    let lora_channel = make_static!(Channel::<NoopRawMutex, LoraType, 1>::new());
+    let lora_channel = LORA_CHANNEL.init(Channel::new());
     let lora_send: Sender<NoopRawMutex, LoraType, 1> = lora_channel.sender();
     let lora_recv = lora_channel.receiver();
 
-    let lora_channel = make_static!(Channel::<NoopRawMutex, LoraStatus, 1>::new());
+    let lora_channel = LORASTATUS_CHANNEL.init(Channel::new());
     let lorast_send = lora_channel.sender();
     let lorast_recv = lora_channel.receiver();
 
-    spawner.must_spawn(display_task(display_spi, gps_recv, gps_pps, dcx, rst, bl, lorast_recv));
+    let dsp_config = st7735_embassy::Config {
+        rgb: false,
+        inverted: true,
+        orientation: st7735_embassy::Orientation::Landscape,
+    };
+
+    // // create driver, display.set_offset(1, 26);
+    // let mut display = Builder::st7789(di)
+    // .with_display_size(FB_SIZE.0 as u16, FB_SIZE.1 as u16)
+    // .with_window_offset_handler(|_e| (1, 26))
+    // .with_color_order(mipidsi::ColorOrder::Bgr)
+    // .with_invert_colors(mipidsi::ColorInversion::Inverted)
+    // .with_orientation(Orientation::LandscapeInverted(true))
+    // .async_init(&mut delay, Some(display_rst))
+    // .await
+    // .unwrap();
+
+    let display = DSP.init(Dsp::new(
+        display_spi,
+        dcx,
+        rst,
+        dsp_config,
+        FB_SIZE.0 as u32,
+        FB_SIZE.1 as u32,
+    ));
+
+    display.set_offset(1, 26);
+
+    display.init(&mut Delay).await.unwrap();
+
+    let area = Rectangle {
+        top_left: Point::zero(),
+        size: Size::new(FB_SIZE.0 as u32, FB_SIZE.1 as u32),
+    };
+    display.fill_solid(&area, Rgb565::GREEN).unwrap();
+    display.flush().await.unwrap();
+
+    bl.set_high();
+
+    info!("Hello4!");
+    spawner.must_spawn(display_task(display, gps_recv, gps_pps, bl, lorast_recv));
 
     let nss = Output::new(p.PIN_3.degrade(), Level::High);
     let reset = Output::new(p.PIN_15.degrade(), Level::High);
@@ -749,9 +765,10 @@ async fn main(spawner: Spawner) {
     // let lora_spi: SpiDeviceWithConfig::new( <'_, NoopRawMutex, Spi<'_, SPI1, Async>> =
     //     SpiBusWithConfig::new(spi_bus, lora_config);
 
-    let lora_spi: SpiDeviceWithConfig<'_, NoopRawMutex, Spi<'_, SPI1, Async>, Output<'_, AnyPin>> =
+    let lora_spi: SpiDeviceWithConfig<'_, NoopRawMutex, Spi<'_, SPI1, Async>, Output<'_>> =
         SpiDeviceWithConfig::new(spi_bus, nss, lora_config.clone());
 
+    info!("Hello5!");
     spawner.must_spawn(lora_task(lora_spi, lora_recv, lorast_send, reset, dio1, busy));
 
     let mut counter: u32 = 0xDEADBEAF;
@@ -766,8 +783,3 @@ async fn main(spawner: Spawner) {
         counter = counter.wrapping_add(1);
     }
 }
-
-use core::convert::TryInto;
-
-use embedded_graphics::prelude::*;
-use embedded_graphics::primitives::{Circle, PrimitiveStyle};

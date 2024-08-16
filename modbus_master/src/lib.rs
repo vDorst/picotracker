@@ -27,7 +27,7 @@ pub enum ModbusError {
     Crc,
     /// Serial Parity error
     Parity,
-    /// Serial OverRun error
+    /// Serial `OverRun` error
     OverRun,
     /// Serial Frame error
     Frame,
