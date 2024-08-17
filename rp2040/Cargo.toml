@@ -27,7 +27,7 @@ panic-probe = { version = "0.3.2", features = ["print-defmt"] }
 futures = { version = "0.3.30", default-features = false, features = ["async-await", "cfg-target-has-atomic"] }
 heapless = "0.8.0"
 embedded-graphics = "0.8.1"
-st7735-embassy = {git="https://github.com/kalkyl/st7735-embassy" }
+st7735-embassy = { path = "../../st7735" }
 
 
 gpslib = { path = "../gpslib", features = ["defmt"]}

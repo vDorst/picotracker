@@ -52,7 +52,7 @@ use lorawan_device::{AppEui, AppKey, DevEui};
 
 use micromath::F32Ext;
 use modbus_master::{create_request, Modbus, ModbusAddr, ModbusError};
-use st7735_embassy::{ST7735, ST7735IF};
+use st7735_embassy::{buffer_size, Orientation, ST7735, ST7735IF};
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
@@ -219,7 +219,7 @@ async fn display_task(
         top_left: Point::new(0, 0),
         size: Size::new(160, 80),
     };
-    let _ = display.fill_solid(&area, Rgb565::BLUE);
+    let _ = display.clear(Rgb565::BLUE);
 
     let (ex, ey) = {
         let s = display.size();
@@ -627,6 +627,9 @@ type Dsp = ST7735<
     SpiDeviceWithConfig<'static, NoopRawMutex, Spi<'static, SPI1, Async>, Output<'static>>,
     Output<'static>,
     Output<'static>,
+    160,
+    80,
+    { buffer_size(160, 80) },
 >;
 static DSP: StaticCell<Dsp> = StaticCell::new();
 static SPI_BUS: StaticCell<SpiBusT> = StaticCell::new();
@@ -697,7 +700,7 @@ async fn main(spawner: Spawner) {
     spawner.must_spawn(gps_handle(gps_uart, gps_send));
     info!("Hello3!");
 
-    /// spawner.must_spawn(modbus_handle(mb_uart));
+    // spawner.must_spawn(modbus_handle(mb_uart));
     let display_cs = Output::new(display_cs, Level::High);
 
     // create SPI
@@ -716,31 +719,17 @@ async fn main(spawner: Spawner) {
     let lorast_recv = lora_channel.receiver();
 
     let dsp_config = st7735_embassy::Config {
-        rgb: false,
+        // Color is 'Bgr'
+        rgb: st7735_embassy::PixelColor::BGR,
+        // Color are Inverted
         inverted: true,
-        orientation: st7735_embassy::Orientation::Landscape,
+        // Orientation Landscape
+        orientation: Orientation::Landscape,
     };
 
-    // // create driver, display.set_offset(1, 26);
-    // let mut display = Builder::st7789(di)
-    // .with_display_size(FB_SIZE.0 as u16, FB_SIZE.1 as u16)
-    // .with_window_offset_handler(|_e| (1, 26))
-    // .with_color_order(mipidsi::ColorOrder::Bgr)
-    // .with_invert_colors(mipidsi::ColorInversion::Inverted)
-    // .with_orientation(Orientation::LandscapeInverted(true))
-    // .async_init(&mut delay, Some(display_rst))
-    // .await
-    // .unwrap();
+    let display = DSP.init(Dsp::new(display_spi, dcx, rst, dsp_config));
 
-    let display = DSP.init(Dsp::new(
-        display_spi,
-        dcx,
-        rst,
-        dsp_config,
-        FB_SIZE.0 as u32,
-        FB_SIZE.1 as u32,
-    ));
-
+    // Waveshare RP2040 has a offset of 1, 26
     display.set_offset(1, 26);
 
     display.init(&mut Delay).await.unwrap();
@@ -768,7 +757,7 @@ async fn main(spawner: Spawner) {
     let lora_spi: SpiDeviceWithConfig<'_, NoopRawMutex, Spi<'_, SPI1, Async>, Output<'_>> =
         SpiDeviceWithConfig::new(spi_bus, nss, lora_config.clone());
 
-    info!("Hello5!");
+    info!("Hello5! dsp = {}", core::mem::size_of::<Dsp>());
     spawner.must_spawn(lora_task(lora_spi, lora_recv, lorast_send, reset, dio1, busy));
 
     let mut counter: u32 = 0xDEADBEAF;
