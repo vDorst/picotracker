@@ -20,13 +20,16 @@ use embassy_embedded_hal::SetConfig;
 use embassy_executor::Spawner;
 use embassy_futures::select::{select, Either};
 use embassy_rp::gpio::{AnyPin, Input, Level, Output, Pin, Pull};
-use embassy_rp::peripherals::SPI1;
+use embassy_rp::i2c::I2c;
+use embassy_rp::pac::watchdog::regs::Tick;
+use embassy_rp::peripherals::{I2C1, SPI1};
 use embassy_rp::spi::{self, Async, Blocking, Config, Spi};
 use embassy_rp::uart::{Async as UartAsync, Config as UConfig, InterruptHandler, Parity, StopBits, Uart};
 use embassy_rp::{bind_interrupts, peripherals};
-use embassy_sync::blocking_mutex::raw::{NoopRawMutex, RawMutex};
+use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex, RawMutex};
 use embassy_sync::channel::{Channel, Receiver, Sender};
 use embassy_sync::mutex::Mutex;
+use embassy_sync::signal::Signal;
 use embassy_time::{Delay, Duration, Ticker, Timer};
 use embedded_graphics::image::{GetPixel, Image, ImageRawLE};
 use embedded_graphics::mono_font::{ascii, MonoTextStyle};
@@ -52,6 +55,7 @@ use lorawan_device::{AppEui, AppKey, DevEui};
 
 use micromath::F32Ext;
 use modbus_master::{create_request, Modbus, ModbusAddr, ModbusError};
+use sht3x::SHT3x;
 use st7735_embassy::{buffer_size, Orientation, ST7735, ST7735IF};
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
@@ -69,6 +73,7 @@ const FB_SIZE: (usize, usize) = (160, 80);
 bind_interrupts!(struct Irqs {
     UART0_IRQ => InterruptHandler<peripherals::UART0>;
     UART1_IRQ => InterruptHandler<peripherals::UART1>;
+    I2C1_IRQ =>  embassy_rp::i2c::InterruptHandler<peripherals::I2C1>;
 });
 
 type GpsType = GpsRmc;
@@ -256,6 +261,13 @@ async fn display_task(
             col = col_iter.next().unwrap();
         }
 
+        // Line
+        ret = f32::from(step) * PI * 2.0 / 60.0;
+        let (sx, sy) = (ret.sin() * rad, ret.cos() * rad);
+        let end = Point::new((sx.trunc()) as i32 + center.x, center.y - (sy.trunc()) as i32);
+        let line = Line::new(center, end).into_styled(PrimitiveStyle::with_stroke(col, 3));
+        unwrap!(line.draw(display));
+
         if let Ok(p) = lora_recv.try_receive() {
             lora_s = p;
         }
@@ -309,6 +321,24 @@ async fn display_task(
             style,
         );
 
+        sp.clear();
+        if let Some(td) = TEMPDATA.try_take() {
+            let _ = sp.push_str("T:");
+            let temp: i16 = td.t.into();
+            i16_to_str(temp, &mut sp);
+            let _ = sp.push(' ');
+            let hum: u8 = td.h.into();
+            u32_to_double(u32::from(hum), &mut sp);
+            let _ = sp.push('%');
+
+            let temp_txt = Text::new(
+                &sp,
+                Point::new(0, (style.font.baseline + (4 * style.font.character_size.height)) as i32),
+                style,
+            );
+            temp_txt.draw(display).unwrap();
+        }
+
         let clear_rec = lora_txt
             .bounding_box()
             .resized_width(160, embedded_graphics::geometry::AnchorX::Right);
@@ -317,30 +347,17 @@ async fn display_task(
 
         lora_txt.draw(display).unwrap();
 
-        ret = f32::from(step) * PI * 2.0 / 60.0;
-
-        let (sx, sy) = (ret.sin() * rad, ret.cos() * rad);
-
-        let end = Point::new((sx.trunc()) as i32 + center.x, center.y - (sy.trunc()) as i32);
-
-        // defmt::println!("x = {}, y = {}, {} {}", end.x, end.y, sx, sy);
-
-        let line = Line::new(center, end).into_styled(PrimitiveStyle::with_stroke(col, 3));
-        unwrap!(line.draw(display));
-
-        let gps_col = if gps_pps.is_high() {
-            Rgb565::GREEN
-        } else {
-            Rgb565::BLACK
-        };
+        let gps_col = if gps_pps.is_high() { Rgb565::GREEN } else { Rgb565::BLUE };
 
         display.set_pixel(159, 0, gps_col.into_storage());
 
         display.flush().await.unwrap();
 
         frame.next().await;
-        let line = Line::new(center, end).into_styled(PrimitiveStyle::with_stroke(Rgb565::BLACK, 3));
-        unwrap!(line.draw(display));
+        // let line = Line::new(center, end).into_styled(PrimitiveStyle::with_stroke(Rgb565::BLACK, 3));
+        // unwrap!(line.draw(display));
+
+        display.clear(Rgb565::BLACK);
 
         step += 1;
     }
@@ -361,6 +378,30 @@ async fn gps_handle(mut uart: Uart<'static, peripherals::UART0, UartAsync>, send
             Err(e) => {
                 println!("GPS: Uart error: {}", e);
                 gps.reset_state();
+            }
+        }
+    }
+}
+
+#[embassy_executor::task]
+async fn tempdata_handle(mut i2c1: I2c<'static, I2C1, embassy_rp::i2c::Async>) {
+    let mut sht = SHT3x::new(&mut i2c1);
+
+    let _ = sht.reset().await;
+    let mut tick = Ticker::every(Duration::from_hz(1));
+    Timer::after(Duration::from_millis(10)).await;
+
+    sht.write(sht3x::CMD::AUTO_1MPS_HIGH).await;
+
+    loop {
+        tick.next().await;
+        match sht.get_measurement().await {
+            Ok((t, h)) => {
+                println!("t: {} h {}", t, h);
+                TEMPDATA.signal(TempData { t, h });
+            }
+            Err(e) => {
+                println!("TEMP: I2C error: {}", e);
             }
         }
     }
@@ -621,6 +662,30 @@ fn u32_to_double<const N: usize>(mut num: u32, st: &mut String<N>) {
     }
 }
 
+fn i16_to_str<const N: usize>(num: i16, st: &mut String<N>) {
+    let mut s = [0; 3];
+
+    let sign = num.is_positive();
+
+    let mut num = num.abs() as u16;
+
+    num /= 10;
+
+    for p in s.iter_mut().rev() {
+        *p = (num % 10) as u8;
+        num /= 10;
+    }
+
+    st.push(if sign { '+' } else { '-' });
+
+    for (idx, num) in s.into_iter().enumerate() {
+        if idx == 2 {
+            st.push('.');
+        }
+        let _ = st.push(char::from_digit(u32::from(num), 10).unwrap());
+    }
+}
+
 type SpiBusT = Mutex<NoopRawMutex, Spi<'static, SPI1, Async>>;
 
 type Dsp = ST7735<
@@ -636,6 +701,15 @@ static SPI_BUS: StaticCell<SpiBusT> = StaticCell::new();
 static GPS_CHANNEL: StaticCell<Channel<NoopRawMutex, GpsType, 1>> = StaticCell::new();
 static LORA_CHANNEL: StaticCell<Channel<NoopRawMutex, LoraType, 1>> = StaticCell::new();
 static LORASTATUS_CHANNEL: StaticCell<Channel<NoopRawMutex, LoraStatus, 1>> = StaticCell::new();
+
+struct TempData {
+    t: sht3x::Tmp,
+    h: sht3x::Hum,
+}
+
+type TempSignal = Signal<CriticalSectionRawMutex, TempData>;
+
+static TEMPDATA: TempSignal = TempSignal::new();
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -691,11 +765,18 @@ async fn main(spawner: Spawner) {
     // Enable LCD backlight
     let mut bl = Output::new(bl, Level::Low);
 
+    // I2C for Tempsensor
+    let sda = p.PIN_18;
+    let scl = p.PIN_19;
+    let config = embassy_rp::i2c::Config::default();
+    let mut i2c1 = I2c::new_async(p.I2C1, scl, sda, Irqs, config);
+
     let gps_channel = GPS_CHANNEL.init(Channel::new());
     let gps_send = gps_channel.sender();
     let gps_recv = gps_channel.receiver();
 
     info!("Hello2!");
+    spawner.must_spawn(tempdata_handle(i2c1));
 
     spawner.must_spawn(gps_handle(gps_uart, gps_send));
     info!("Hello3!");
