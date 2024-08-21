@@ -1,0 +1,10 @@
+[package]
+name = "packet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hex = "0.4.3"
+minicbor = {version =   "0.24.2", features = ["half"]}

@@ -11,7 +11,7 @@ members = [
     "gpslib",
     "modbus_master",
     "envconst"
-]
+, "packet"]
 resolver = "2"
 
 [profile.release]
